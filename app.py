@@ -1,323 +1,567 @@
-from __future__ import annotations
-
-from io import BytesIO
-from pathlib import Path
+import io
 import re
 import unicodedata
+from typing import Iterable
 
+import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="Control documental semanal", page_icon="📋", layout="wide")
 
-VEHICLE_DOCS = {
-    "V. SOAT": "SOAT",
-    "V. TECNO": "Revisión técnico-mecánica",
-    "T.O VEN": "Tarjeta de operación",
-    "V. INSPECC": "Inspección",
-    "V. P. CONTR": "Póliza contractual",
-    "V. P. EXTRA": "Póliza extracontractual",
-}
-DRIVER_DOCS = {
-    "V. LICENCIA": "Licencia de conducción",
-    "V. EXAMEN": "Examen médico",
-    "V. SEG SOC": "Seguridad social",
-    "V. VACUNAS": "Vacunas",
-    "V. FORMATO": "Formato",
-    "V. CTROL IN": "Control interno",
-    "V. MECANIC": "Mecánica básica",
-    "V. PRIM AUX": "Primeros auxilios",
-    "V. CMDPC": "CMDPC",
-}
-STATUS_ORDER = ["VENCIDO", "ALERTA SEMANAL", "PRÓXIMO A VENCER", "VIGENTE", "SIN FECHA"]
-STATUS_ICON = {
-    "VENCIDO": "🔴",
-    "ALERTA SEMANAL": "🟠",
-    "PRÓXIMO A VENCER": "🟡",
-    "VIGENTE": "🟢",
-    "SIN FECHA": "⚪",
-}
+st.set_page_config(
+    page_title="RCN Data Factory",
+    page_icon="🏭",
+    layout="wide",
+)
+
+st.markdown("""
+<style>
+html,body,[class*="css"]{font-family:"Segoe UI",Arial,sans-serif;color:#1F1F1F!important}
+.block-container{padding-top:1rem;padding-left:1.2rem;padding-right:1.2rem}
+h1,h2,h3{color:#003B75!important;font-weight:800!important}
+.kpi{background:#fff;border:1px solid #DDE3EE;border-radius:12px;padding:10px 12px;min-height:88px;
+box-shadow:0 1px 6px rgba(0,0,0,.06);margin-bottom:8px}
+.kpi-title{color:#003B75;font-size:.72rem;font-weight:800;text-transform:uppercase}
+.kpi-value{color:#101828;font-size:1.12rem;font-weight:800;line-height:1.2;margin-top:4px}
+.kpi-note{font-size:.72rem;color:#667085;margin-top:4px}
+[data-testid="stDataFrame"] div[role="columnheader"]{
+background-color:#003B75!important;color:#fff!important;font-weight:800!important;
+justify-content:center!important;text-align:center!important}
+[data-testid="stDataFrame"] div[role="gridcell"]{
+justify-content:center!important;text-align:center!important;color:#1F1F1F!important}
+</style>
+""", unsafe_allow_html=True)
 
 
-def clean_name(value: object) -> str:
-    text = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode()
-    return re.sub(r"\s+", " ", text.strip().upper())
-
-
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out.columns = [clean_name(c) for c in out.columns]
-    return out
-
-
-def classify(days: object, has_date: bool) -> str:
-    if not has_date:
-        return "SIN FECHA"
-    days = int(days)
-    if days < 0:
-        return "VENCIDO"
-    if days <= 7:
-        return "ALERTA SEMANAL"
-    if days <= 30:
-        return "PRÓXIMO A VENCER"
-    return "VIGENTE"
-
-
-def prepare_alerts(
-    df: pd.DataFrame,
-    docs: dict[str, str],
-    reference_date: pd.Timestamp,
-    entity_type: str,
-) -> pd.DataFrame:
-    df = normalize_columns(df)
-    resolved_docs = {clean_name(k): v for k, v in docs.items()}
-    available_docs = {col: label for col, label in resolved_docs.items() if col in df.columns}
-    if not available_docs:
-        raise ValueError("No se encontraron las columnas documentales esperadas.")
-
-    id_col = "PLACA" if entity_type == "Vehículo" else "CC/NIT"
-    name_col = "POSEEDOR.1" if entity_type == "Vehículo" else "NOMBRE CO"
-    state_col = "ESTADO" if entity_type == "Vehículo" else "ESTADO CO"
-    phone_col = "CELULAR" if "CELULAR" in df.columns else None
-
-    base_cols = [c for c in [id_col, name_col, state_col, phone_col, "TIPO VEHIC", "MARCA", "AFILIADORA"] if c]
-    base_cols = [c for c in base_cols if c in df.columns]
-    long = df[base_cols + list(available_docs)].melt(
-        id_vars=base_cols,
-        value_vars=list(available_docs),
-        var_name="COLUMNA_DOCUMENTO",
-        value_name="FECHA_VENCIMIENTO",
+def sin_acentos(texto: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", str(texto))
+        if not unicodedata.combining(c)
     )
-    long["DOCUMENTO"] = long["COLUMNA_DOCUMENTO"].map(available_docs)
-    long["FECHA_VENCIMIENTO"] = pd.to_datetime(long["FECHA_VENCIMIENTO"], errors="coerce").dt.normalize()
-    long["DIAS_RESTANTES"] = (long["FECHA_VENCIMIENTO"] - reference_date).dt.days
-    long["CLASIFICACION"] = [
-        classify(days, pd.notna(date))
-        for days, date in zip(long["DIAS_RESTANTES"], long["FECHA_VENCIMIENTO"])
-    ]
-    long["TIPO_REGISTRO"] = entity_type
-    long["IDENTIFICACION"] = long[id_col].astype("string").fillna("SIN IDENTIFICACIÓN").str.strip()
-    long["RESPONSABLE"] = long.get(name_col, pd.Series(index=long.index, dtype="string")).astype("string").fillna("SIN RESPONSABLE").str.strip()
-    long["ESTADO_REGISTRO"] = long.get(state_col, pd.Series(index=long.index, dtype="string")).astype("string").fillna("SIN ESTADO").str.strip()
-    long["CELULAR_CONTACTO"] = (
-        long[phone_col].astype("string").str.replace(r"\.0$", "", regex=True).fillna("")
-        if phone_col and phone_col in long.columns else ""
+
+
+def normalizar_columna(valor) -> str:
+    texto = sin_acentos(str(valor)).upper().strip()
+    texto = re.sub(r"[^A-Z0-9]+", "_", texto)
+    return texto.strip("_")
+
+
+def normalizar_texto(valor) -> str:
+    if pd.isna(valor):
+        return ""
+    return sin_acentos(str(valor)).upper().strip()
+
+
+def normalizar_id(valor) -> str:
+    texto = normalizar_texto(valor).replace(" ", "")
+    if texto.endswith(".0"):
+        texto = texto[:-2]
+    invalidos = {"", "NAN", "NONE", "NULL", "0", "-", "SINREMESA", "SIN_REMESA"}
+    return "" if texto in invalidos else texto
+
+
+def convertir_fecha(serie: pd.Series) -> pd.Series:
+    return pd.to_datetime(serie, errors="coerce", dayfirst=True)
+
+
+def convertir_numero(serie: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(serie):
+        return pd.to_numeric(serie, errors="coerce").fillna(0)
+    texto = serie.astype(str).str.upper().str.strip()
+    texto = texto.str.replace("COP", "", regex=False)
+    texto = texto.str.replace("$", "", regex=False)
+    texto = texto.str.replace(" ", "", regex=False)
+    tiene_coma = texto.str.contains(",", regex=False)
+    texto.loc[tiene_coma] = (
+        texto.loc[tiene_coma]
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
     )
-    return long
+    texto.loc[~tiene_coma] = texto.loc[~tiene_coma].str.replace(",", "", regex=False)
+    return pd.to_numeric(texto, errors="coerce").fillna(0)
 
 
-def summary_by_entity(alerts: pd.DataFrame) -> pd.DataFrame:
-    relevant = alerts[alerts["CLASIFICACION"].isin(["VENCIDO", "ALERTA SEMANAL", "PRÓXIMO A VENCER", "SIN FECHA"])].copy()
-    if relevant.empty:
-        return pd.DataFrame()
-    grouped = (
-        relevant.groupby(["TIPO_REGISTRO", "IDENTIFICACION", "RESPONSABLE", "ESTADO_REGISTRO", "CELULAR_CONTACTO"], dropna=False)
-        .agg(
-            DOCUMENTOS_EN_ALERTA=("DOCUMENTO", "count"),
-            VENCIDOS=("CLASIFICACION", lambda s: (s == "VENCIDO").sum()),
-            ALERTA_7_DIAS=("CLASIFICACION", lambda s: (s == "ALERTA SEMANAL").sum()),
-            PROXIMOS_30_DIAS=("CLASIFICACION", lambda s: (s == "PRÓXIMO A VENCER").sum()),
-            SIN_FECHA=("CLASIFICACION", lambda s: (s == "SIN FECHA").sum()),
-            PRIMER_VENCIMIENTO=("FECHA_VENCIMIENTO", "min"),
-        )
-        .reset_index()
+def buscar_columna(df: pd.DataFrame, candidatos):
+    mapa = {normalizar_columna(c): c for c in df.columns}
+    for candidato in candidatos:
+        clave = normalizar_columna(candidato)
+        if clave in mapa:
+            return mapa[clave]
+    return None
+
+
+def llave_fecha_orden(fecha, orden) -> str:
+    f = pd.to_datetime(fecha, errors="coerce")
+    fecha_txt = f.strftime("%Y-%m-%d") if pd.notna(f) else ""
+    return f"{fecha_txt}|{normalizar_id(orden)}"
+
+
+def entero(valor) -> str:
+    try:
+        return f"{int(round(float(valor))):,}".replace(",", ".")
+    except Exception:
+        return "0"
+
+
+def porcentaje(valor) -> str:
+    try:
+        return f"{float(valor):.2f}%".replace(".", ",")
+    except Exception:
+        return "0,00%"
+
+
+def kpi(titulo, valor, nota=""):
+    st.markdown(
+        f'<div class="kpi"><div class="kpi-title">{titulo}</div>'
+        f'<div class="kpi-value">{valor}</div><div class="kpi-note">{nota}</div></div>',
+        unsafe_allow_html=True,
     )
-    grouped["PRIORIDAD"] = grouped.apply(
-        lambda r: "CRÍTICA" if r["VENCIDOS"] > 0 else ("ALTA" if r["ALERTA_7_DIAS"] > 0 else "MEDIA"), axis=1
-    )
-    return grouped.sort_values(["VENCIDOS", "ALERTA_7_DIAS", "PROXIMOS_30_DIAS"], ascending=False)
-
-
-def build_messages(alerts: pd.DataFrame, reference_date: pd.Timestamp) -> pd.DataFrame:
-    rows = []
-    weekly = alerts[alerts["CLASIFICACION"].isin(["VENCIDO", "ALERTA SEMANAL", "PRÓXIMO A VENCER"])].copy()
-    for keys, group in weekly.groupby(["TIPO_REGISTRO", "IDENTIFICACION", "RESPONSABLE", "ESTADO_REGISTRO", "CELULAR_CONTACTO"], dropna=False):
-        entity_type, identification, responsible, record_state, phone = keys
-        lines = []
-        for _, row in group.sort_values(["CLASIFICACION", "FECHA_VENCIMIENTO"]).iterrows():
-            date_text = row["FECHA_VENCIMIENTO"].strftime("%d/%m/%Y") if pd.notna(row["FECHA_VENCIMIENTO"]) else "sin fecha"
-            days = row["DIAS_RESTANTES"]
-            if row["CLASIFICACION"] == "VENCIDO":
-                detail = f"vencido hace {abs(int(days))} día(s)"
-            elif row["CLASIFICACION"] == "ALERTA SEMANAL":
-                detail = "vence hoy" if int(days) == 0 else f"vence en {int(days)} día(s)"
-            else:
-                detail = f"vence en {int(days)} día(s)"
-            lines.append(f"• {row['DOCUMENTO']}: {date_text} ({detail})")
-        intro = f"Buen día, {responsible}." if responsible and responsible != "SIN RESPONSABLE" else "Buen día."
-        subject = f"la placa {identification}" if entity_type == "Vehículo" else f"el conductor identificado con {identification}"
-        message = (
-            f"{intro}\n\nMi nombre es Carolina Rodríguez, Coordinadora de Vigía Servicio Especial.\n\n"
-            f"El presente mensaje tiene como finalidad generar una alerta sobre el estado documental de {subject}.\n"
-            f"Estado actual del registro: {record_state}.\n\n"
-            + "\n".join(lines)
-            + "\n\nAgradecemos realizar la renovación o actualización de los documentos relacionados y enviarlos a la mayor brevedad posible para actualizar nuestro sistema.\n\n"
-            + "Esta solicitud se realiza para mantener actualizado el control documental y evitar novedades, bloqueos o restricciones que puedan afectar la operación.\n\nMuchas gracias por su colaboración."
-        )
-        rows.append({
-            "TIPO_REGISTRO": entity_type,
-            "IDENTIFICACION": identification,
-            "RESPONSABLE": responsible,
-            "ESTADO_REGISTRO": record_state,
-            "CELULAR": phone,
-            "FECHA_GENERACION": reference_date.strftime("%d/%m/%Y"),
-            "MENSAJE": message,
-        })
-    return pd.DataFrame(rows)
-
-
-def to_excel(alerts: pd.DataFrame, summary: pd.DataFrame, messages: pd.DataFrame) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        alerts.to_excel(writer, sheet_name="Detalle alertas", index=False)
-        summary.to_excel(writer, sheet_name="Resumen responsables", index=False)
-        messages.to_excel(writer, sheet_name="Mensajes", index=False)
-        for sheet in writer.book.worksheets:
-            sheet.freeze_panes = "A2"
-            sheet.auto_filter.ref = sheet.dimensions
-            for column in sheet.columns:
-                max_length = min(max((len(str(cell.value)) if cell.value is not None else 0) for cell in column) + 2, 45)
-                sheet.column_dimensions[column[0].column_letter].width = max(12, max_length)
-    return output.getvalue()
 
 
 @st.cache_data(show_spinner=False)
-def load_workbook(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
-    book = pd.ExcelFile(BytesIO(file_bytes))
-    normalized_sheets = {clean_name(s): s for s in book.sheet_names}
-    vehicle_sheet = normalized_sheets.get("VEHICULOS")
-    driver_sheet = normalized_sheets.get("CONDUCTORES")
-    if not vehicle_sheet or not driver_sheet:
-        raise ValueError("El archivo debe contener las hojas 'vehiculos' y 'conductores'.")
-    return pd.read_excel(BytesIO(file_bytes), sheet_name=vehicle_sheet), pd.read_excel(BytesIO(file_bytes), sheet_name=driver_sheet)
+def leer_mejor_hoja(archivo_bytes: bytes, preferidas: tuple, claves: tuple):
+    bio = io.BytesIO(archivo_bytes)
+    xls = pd.ExcelFile(bio)
+    orden = [h for h in preferidas if h in xls.sheet_names] + [
+        h for h in xls.sheet_names if h not in preferidas
+    ]
+    claves_norm = {normalizar_columna(c) for c in claves}
+    mejor_hoja, mejor_df, mejor_puntaje = None, None, -1
+
+    for hoja in orden:
+        try:
+            bio.seek(0)
+            df = pd.read_excel(bio, sheet_name=hoja)
+            if df.empty:
+                continue
+            cols = {normalizar_columna(c) for c in df.columns}
+            puntaje = sum(c in cols for c in claves_norm)
+            if hoja in preferidas:
+                puntaje += 3
+            if puntaje > mejor_puntaje:
+                mejor_hoja, mejor_df, mejor_puntaje = hoja, df, puntaje
+        except Exception:
+            continue
+
+    if mejor_df is None:
+        raise ValueError("No se encontró una hoja compatible.")
+    return mejor_hoja, mejor_df
 
 
-st.title("📋 Dashboard semanal de control documental")
-st.caption("Control de vencimientos de vehículos y conductores, con alertas descargables y mensajes semanales.")
+def preparar_data(df: pd.DataFrame) -> pd.DataFrame:
+    columnas = {
+        "fecha": buscar_columna(df, ["Fecha Servicio"]),
+        "orden": buscar_columna(
+            df,
+            [
+                "No. Orden Servicio",
+                "No.OrdenServicio",
+                "No Orden Servicio",
+                "NoOrdenServicio",
+                "Orden Servicio",
+            ],
+        ),
+        "estado": buscar_columna(df, ["Estado Servicio"]),
+        "centro": buscar_columna(df, ["Centro / Orden Costo"]),
+        "modalidad_servicio": buscar_columna(df, ["Modalidad de Servicio"]),
+        "vehiculo": buscar_columna(df, ["Tipo de vehículo", "Tipo Vehiculo"]),
+        "modalidad": buscar_columna(df, ["Modalidad"]),
+        "origen": buscar_columna(df, ["Origen"]),
+        "destino": buscar_columna(df, ["Destino"]),
+    }
+    faltantes = [k for k in ["fecha", "orden", "estado"] if columnas[k] is None]
+    if faltantes:
+        encabezados = ", ".join(str(c) for c in df.columns[:30])
+        raise ValueError(
+            f"DATA no contiene columnas obligatorias: {', '.join(faltantes)}. "
+            f"Encabezados detectados: {encabezados}"
+        )
+
+    out = pd.DataFrame({
+        "DATA_FECHA_SERVICIO": convertir_fecha(df[columnas["fecha"]]),
+        "DATA_ORDEN_SERVICIO": df[columnas["orden"]].astype(str).str.strip(),
+        "DATA_ESTADO_SERVICIO": df[columnas["estado"]].astype(str).str.strip(),
+        "DATA_CENTRO_ORDEN_COSTO": df[columnas["centro"]].astype(str).str.strip() if columnas["centro"] else "",
+        "DATA_MODALIDAD_SERVICIO": df[columnas["modalidad_servicio"]].astype(str).str.strip() if columnas["modalidad_servicio"] else "",
+        "DATA_TIPO_VEHICULO": df[columnas["vehiculo"]].astype(str).str.strip() if columnas["vehiculo"] else "",
+        "DATA_MODALIDAD": df[columnas["modalidad"]].astype(str).str.strip() if columnas["modalidad"] else "",
+        "DATA_ORIGEN": df[columnas["origen"]].astype(str).str.strip() if columnas["origen"] else "",
+        "DATA_DESTINO": df[columnas["destino"]].astype(str).str.strip() if columnas["destino"] else "",
+    })
+    out = out.dropna(subset=["DATA_FECHA_SERVICIO"]).copy()
+    out["LLAVE_DATA_PAT"] = [
+        llave_fecha_orden(f, o)
+        for f, o in zip(out["DATA_FECHA_SERVICIO"], out["DATA_ORDEN_SERVICIO"])
+    ]
+    out["DATA_CANCELADO"] = out["DATA_ESTADO_SERVICIO"].apply(
+        lambda x: "CANCEL" in normalizar_texto(x)
+    )
+    return out
+
+
+def preparar_pat(df: pd.DataFrame) -> pd.DataFrame:
+    columnas = {
+        "fecha": buscar_columna(df, ["Fecha Servicio"]),
+        "orden": buscar_columna(
+            df,
+            [
+                "No. Orden Servicio",
+                "No.OrdenServicio",
+                "No Orden Servicio",
+                "NoOrdenServicio",
+                "SERVICIO",
+            ],
+        ),
+        "remesa": buscar_columna(df, ["REMESAS", "REMESA"]),
+        "estado": buscar_columna(df, ["Estado"]),
+        "centro": buscar_columna(df, ["Centro / Orden Costo"]),
+        "modalidad": buscar_columna(df, ["Modalidad"]),
+        "modalidad_tarifa": buscar_columna(df, ["Modalidad.1"]),
+        "origen": buscar_columna(df, ["ORIGEN"]),
+        "destino": buscar_columna(df, ["DESTINO"]),
+    }
+    faltantes = [k for k in ["fecha", "orden", "remesa", "estado"] if columnas[k] is None]
+    if faltantes:
+        raise ValueError(f"PAT no contiene columnas obligatorias: {', '.join(faltantes)}")
+
+    out = pd.DataFrame({
+        "PAT_FECHA_SERVICIO": convertir_fecha(df[columnas["fecha"]]),
+        "PAT_ORDEN_SERVICIO": df[columnas["orden"]].astype(str).str.strip(),
+        "PAT_REMESA": df[columnas["remesa"]].astype(str).str.strip(),
+        "PAT_ESTADO": df[columnas["estado"]].astype(str).str.strip(),
+        "PAT_CENTRO_ORDEN_COSTO": df[columnas["centro"]].astype(str).str.strip() if columnas["centro"] else "",
+        "PAT_MODALIDAD": df[columnas["modalidad"]].astype(str).str.strip() if columnas["modalidad"] else "",
+        "PAT_MODALIDAD_TARIFA": df[columnas["modalidad_tarifa"]].astype(str).str.strip() if columnas["modalidad_tarifa"] else "",
+        "PAT_ORIGEN": df[columnas["origen"]].astype(str).str.strip() if columnas["origen"] else "",
+        "PAT_DESTINO": df[columnas["destino"]].astype(str).str.strip() if columnas["destino"] else "",
+    })
+    out = out.dropna(subset=["PAT_FECHA_SERVICIO"]).copy()
+    out["PAT_REMESA_NORM"] = out["PAT_REMESA"].apply(normalizar_id)
+    out["LLAVE_DATA_PAT"] = [
+        llave_fecha_orden(f, o)
+        for f, o in zip(out["PAT_FECHA_SERVICIO"], out["PAT_ORDEN_SERVICIO"])
+    ]
+    return out
+
+
+def preparar_trayectos(df: pd.DataFrame) -> pd.DataFrame:
+    remesa_col = buscar_columna(df, ["REMESA"])
+    carga_col = buscar_columna(df, ["CARGA"])
+    estado_col = buscar_columna(df, ["ESTADO OP"])
+    if not all([remesa_col, carga_col, estado_col]):
+        raise ValueError("TRAYECTOS debe contener REMESA, CARGA y ESTADO OP.")
+
+    out = df.copy()
+    out["ASTRANS_REMESA_NORM"] = out[remesa_col].apply(normalizar_id)
+    out["ASTRANS_CARGA_FECHA"] = convertir_fecha(out[carga_col])
+    out["ASTRANS_ESTADO_OP_NORM"] = out[estado_col].apply(normalizar_texto)
+
+    vcliente = buscar_columna(out, ["V.CLIENTE", "V CLIENTE"])
+    vconduct = buscar_columna(out, ["V.CONDUCT", "V CONDUCT"])
+    if vcliente:
+        out["V_CLIENTE_NUM"] = convertir_numero(out[vcliente])
+    else:
+        out["V_CLIENTE_NUM"] = 0
+    if vconduct:
+        out["V_CONDUCT_NUM"] = convertir_numero(out[vconduct])
+    else:
+        out["V_CONDUCT_NUM"] = 0
+
+    out["MARGEN_CALCULADO"] = out["V_CLIENTE_NUM"] - out["V_CONDUCT_NUM"]
+    return out
+
+
+def primer_valido(serie: pd.Series):
+    for valor in serie:
+        if pd.notna(valor) and str(valor).strip() != "":
+            return valor
+    return ""
+
+
+def unir_unicos(serie: pd.Series):
+    valores = []
+    for valor in serie:
+        if pd.notna(valor):
+            txt = str(valor).strip()
+            if txt and txt not in valores:
+                valores.append(txt)
+    return " | ".join(valores)
+
+
+def consolidar(data: pd.DataFrame, pat: pd.DataFrame, tray: pd.DataFrame):
+    data_ag = (
+        data.groupby("LLAVE_DATA_PAT", as_index=False)
+        .agg(
+            DATA_REGISTROS=("LLAVE_DATA_PAT", "size"),
+            DATA_FECHA_SERVICIO=("DATA_FECHA_SERVICIO", "min"),
+            DATA_ORDEN_SERVICIO=("DATA_ORDEN_SERVICIO", primer_valido),
+            DATA_ESTADO_SERVICIO=("DATA_ESTADO_SERVICIO", unir_unicos),
+            DATA_CENTRO_ORDEN_COSTO=("DATA_CENTRO_ORDEN_COSTO", unir_unicos),
+            DATA_MODALIDAD_SERVICIO=("DATA_MODALIDAD_SERVICIO", unir_unicos),
+            DATA_TIPO_VEHICULO=("DATA_TIPO_VEHICULO", unir_unicos),
+            DATA_MODALIDAD=("DATA_MODALIDAD", unir_unicos),
+            DATA_ORIGEN=("DATA_ORIGEN", unir_unicos),
+            DATA_DESTINO=("DATA_DESTINO", unir_unicos),
+            DATA_CANCELADO=("DATA_CANCELADO", "max"),
+        )
+    )
+
+    pat_data = pat.merge(data_ag, on="LLAVE_DATA_PAT", how="left")
+    pat_data["COINCIDE_DATA_PAT"] = pat_data["DATA_REGISTROS"].fillna(0).gt(0)
+    pat_data["DIF_DIAS_DATA_PAT"] = (
+        pat_data["PAT_FECHA_SERVICIO"] - pat_data["DATA_FECHA_SERVICIO"]
+    ).dt.days
+
+    pat_valid = pat_data[pat_data["PAT_REMESA_NORM"].ne("")].copy()
+    pat_remesa = (
+        pat_valid.groupby("PAT_REMESA_NORM", as_index=False)
+        .agg(
+            PAT_REGISTROS=("PAT_REMESA_NORM", "size"),
+            PAT_FECHA_SERVICIO=("PAT_FECHA_SERVICIO", "min"),
+            PAT_FECHA_SERVICIO_MAX=("PAT_FECHA_SERVICIO", "max"),
+            PAT_ORDEN_SERVICIO=("PAT_ORDEN_SERVICIO", unir_unicos),
+            PAT_REMESA=("PAT_REMESA", primer_valido),
+            PAT_ESTADO=("PAT_ESTADO", unir_unicos),
+            PAT_CENTRO_ORDEN_COSTO=("PAT_CENTRO_ORDEN_COSTO", unir_unicos),
+            PAT_MODALIDAD=("PAT_MODALIDAD", unir_unicos),
+            PAT_MODALIDAD_TARIFA=("PAT_MODALIDAD_TARIFA", unir_unicos),
+            PAT_ORIGEN=("PAT_ORIGEN", unir_unicos),
+            PAT_DESTINO=("PAT_DESTINO", unir_unicos),
+            COINCIDE_DATA_PAT=("COINCIDE_DATA_PAT", "max"),
+            DATA_FECHA_SERVICIO=("DATA_FECHA_SERVICIO", "min"),
+            DATA_ORDEN_SERVICIO=("DATA_ORDEN_SERVICIO", unir_unicos),
+            DATA_ESTADO_SERVICIO=("DATA_ESTADO_SERVICIO", unir_unicos),
+            DATA_CENTRO_ORDEN_COSTO=("DATA_CENTRO_ORDEN_COSTO", unir_unicos),
+            DATA_MODALIDAD_SERVICIO=("DATA_MODALIDAD_SERVICIO", unir_unicos),
+            DATA_TIPO_VEHICULO=("DATA_TIPO_VEHICULO", unir_unicos),
+            DATA_MODALIDAD=("DATA_MODALIDAD", unir_unicos),
+            DATA_ORIGEN=("DATA_ORIGEN", unir_unicos),
+            DATA_DESTINO=("DATA_DESTINO", unir_unicos),
+            DATA_CANCELADO=("DATA_CANCELADO", "max"),
+        )
+    )
+
+    consolidado = tray.merge(
+        pat_remesa,
+        left_on="ASTRANS_REMESA_NORM",
+        right_on="PAT_REMESA_NORM",
+        how="left",
+    )
+
+    consolidado["COINCIDE_REMESA_PAT_ASTRANS"] = consolidado["PAT_REGISTROS"].fillna(0).gt(0)
+    consolidado["DIF_DIAS_PAT_ASTRANS"] = (
+        consolidado["ASTRANS_CARGA_FECHA"] - consolidado["PAT_FECHA_SERVICIO"]
+    ).dt.days
+
+    consolidado["ESTADO_TRAZABILIDAD"] = np.select(
+        [
+            consolidado["COINCIDE_REMESA_PAT_ASTRANS"] & consolidado["COINCIDE_DATA_PAT"].fillna(False),
+            consolidado["COINCIDE_REMESA_PAT_ASTRANS"] & ~consolidado["COINCIDE_DATA_PAT"].fillna(False),
+            ~consolidado["COINCIDE_REMESA_PAT_ASTRANS"],
+        ],
+        [
+            "CONCILIADO DATA + PAT + ASTRANS",
+            "CONCILIADO PAT + ASTRANS / DATA NO ENCONTRADA",
+            "REMESA ASTRANS SIN REGISTRO PAT",
+        ],
+        default="REVISAR",
+    )
+
+    consolidado["RESULTADO_SERVICIO"] = np.select(
+        [
+            consolidado["DATA_CANCELADO"].fillna(False) & consolidado["COINCIDE_REMESA_PAT_ASTRANS"],
+            consolidado["COINCIDE_REMESA_PAT_ASTRANS"],
+        ],
+        [
+            "CANCELADO EN DATA, PERO EJECUTADO CON REMESA",
+            "EJECUTADO Y CONCILIADO",
+        ],
+        default="EJECUTADO EN ASTRANS SIN EVIDENCIA PAT",
+    )
+
+    remesas_astrans = set(tray.loc[tray["ASTRANS_REMESA_NORM"].ne(""), "ASTRANS_REMESA_NORM"])
+    pat_sin_astrans = pat_remesa[
+        ~pat_remesa["PAT_REMESA_NORM"].isin(remesas_astrans)
+    ].copy()
+
+    llaves_pat = set(pat["LLAVE_DATA_PAT"])
+    data_sin_pat = data[~data["LLAVE_DATA_PAT"].isin(llaves_pat)].copy()
+
+    duplicados_pat = (
+        pat[pat["PAT_REMESA_NORM"].ne("")]
+        .groupby("PAT_REMESA_NORM", as_index=False)
+        .size()
+        .rename(columns={"size": "CANTIDAD_PAT"})
+    )
+    duplicados_pat = duplicados_pat[duplicados_pat["CANTIDAD_PAT"] > 1]
+
+    duplicados_astrans = (
+        tray[tray["ASTRANS_REMESA_NORM"].ne("")]
+        .groupby("ASTRANS_REMESA_NORM", as_index=False)
+        .size()
+        .rename(columns={"size": "CANTIDAD_ASTRANS"})
+    )
+    duplicados_astrans = duplicados_astrans[
+        duplicados_astrans["CANTIDAD_ASTRANS"] > 1
+    ]
+
+    return consolidado, pat_data, pat_sin_astrans, data_sin_pat, duplicados_pat, duplicados_astrans
+
+
+def crear_excel(resultados: dict[str, pd.DataFrame]) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter", datetime_format="dd/mm/yyyy hh:mm") as writer:
+        formato_header = writer.book.add_format({
+            "bold": True,
+            "font_color": "white",
+            "bg_color": "#003B75",
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+        })
+
+        for nombre, df in resultados.items():
+            hoja = nombre[:31]
+            df.to_excel(writer, index=False, sheet_name=hoja)
+            ws = writer.sheets[hoja]
+            ws.freeze_panes(1, 0)
+            if len(df.columns):
+                ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+                for col_idx, col in enumerate(df.columns):
+                    ws.write(0, col_idx, col, formato_header)
+                    ancho = min(max(len(str(col)) + 3, 14), 32)
+                    ws.set_column(col_idx, col_idx, ancho)
+    return buffer.getvalue()
+
+
+st.title("🏭 RCN Data Factory")
+st.caption("Consolida históricos DATA, PAT y TRAYECTOS en una Base Maestra RCN.")
 
 with st.sidebar:
-    st.header("Configuración")
-    uploaded = st.file_uploader("Cargar archivo Excel", type=["xlsx", "xls"])
-    reference_date = pd.Timestamp(st.date_input("Fecha de corte", value=pd.Timestamp.today().date())).normalize()
-    operational_status_filter = st.multiselect(
-        "Estados de registro incluidos",
-        ["ACTIVO", "SUSPENDIDO", "INACTIVO", "SIN ESTADO"],
-        default=["ACTIVO", "SUSPENDIDO", "INACTIVO"],
-        help="Puedes analizar todos los estados o seleccionar únicamente los que necesites para el seguimiento semanal.",
-    )
-    selected_statuses = st.multiselect(
-        "Clasificaciones",
-        STATUS_ORDER,
-        default=["VENCIDO", "ALERTA SEMANAL", "PRÓXIMO A VENCER", "SIN FECHA"],
-    )
+    st.header("Cargar históricos")
+    f_data = st.file_uploader("DATA histórico", type=["xlsx"], key="data")
+    f_pat = st.file_uploader("SERVICIO PAT histórico", type=["xlsx"], key="pat")
+    f_tray = st.file_uploader("TRAYECTOS histórico", type=["xlsx"], key="tray")
 
-if uploaded is None:
-    st.info("Carga el archivo de control documental para iniciar el análisis.")
+if not all([f_data, f_pat, f_tray]):
+    st.warning("Carga los tres históricos para generar la Base Maestra.")
     st.stop()
 
 try:
-    vehicles, drivers = load_workbook(uploaded.getvalue())
-    vehicle_alerts = prepare_alerts(vehicles, VEHICLE_DOCS, reference_date, "Vehículo")
-    driver_alerts = prepare_alerts(drivers, DRIVER_DOCS, reference_date, "Conductor")
-    all_alerts = pd.concat([vehicle_alerts, driver_alerts], ignore_index=True)
+    hoja_data, raw_data = leer_mejor_hoja(
+        f_data.getvalue(),
+        ("Sheet1",),
+        (
+            "Fecha Servicio",
+            "No. Orden Servicio",
+            "No.OrdenServicio",
+            "Estado Servicio",
+        ),
+    )
+    hoja_pat, raw_pat = leer_mejor_hoja(
+        f_pat.getvalue(),
+        ("ACTUALIZADO", "BASE"),
+        (
+            "Fecha Servicio",
+            "No. Orden Servicio",
+            "No.OrdenServicio",
+            "SERVICIO",
+            "REMESAS",
+            "Estado",
+        ),
+    )
+    hoja_tray, raw_tray = leer_mejor_hoja(
+        f_tray.getvalue(),
+        ("Sheet1",),
+        ("REMESA", "CARGA", "ESTADO OP"),
+    )
+
+    data = preparar_data(raw_data)
+    pat = preparar_pat(raw_pat)
+    tray = preparar_trayectos(raw_tray)
+
+    (
+        consolidado,
+        cruce_data_pat,
+        pat_sin_astrans,
+        data_sin_pat,
+        duplicados_pat,
+        duplicados_astrans,
+    ) = consolidar(data, pat, tray)
+
 except Exception as exc:
-    st.error(f"No fue posible procesar el archivo: {exc}")
+    st.error(f"No fue posible procesar los archivos: {exc}")
     st.stop()
 
-all_alerts["ESTADO_NORMALIZADO"] = all_alerts["ESTADO_REGISTRO"].map(clean_name)
-if operational_status_filter:
-    all_alerts = all_alerts[all_alerts["ESTADO_NORMALIZADO"].isin(operational_status_filter)]
-
-filtered = all_alerts[all_alerts["CLASIFICACION"].isin(selected_statuses)].copy()
-
-entity_options = sorted(filtered["TIPO_REGISTRO"].dropna().unique())
-state_options = sorted(filtered["ESTADO_REGISTRO"].dropna().unique())
-col1, col2, col3 = st.columns(3)
-with col1:
-    entity_filter = st.multiselect("Tipo de registro", entity_options, default=entity_options)
-with col2:
-    state_filter = st.multiselect("Estado operativo", state_options, default=state_options)
-with col3:
-    search = st.text_input("Buscar placa, cédula o nombre")
-
-filtered = filtered[filtered["TIPO_REGISTRO"].isin(entity_filter) & filtered["ESTADO_REGISTRO"].isin(state_filter)]
-if search.strip():
-    needle = clean_name(search)
-    filtered = filtered[
-        filtered["IDENTIFICACION"].map(clean_name).str.contains(needle, na=False)
-        | filtered["RESPONSABLE"].map(clean_name).str.contains(needle, na=False)
-    ]
-
-metrics = {
-    "Vencidos": int((filtered["CLASIFICACION"] == "VENCIDO").sum()),
-    "Vencen en 7 días": int((filtered["CLASIFICACION"] == "ALERTA SEMANAL").sum()),
-    "Vencen en 30 días": int((filtered["CLASIFICACION"] == "PRÓXIMO A VENCER").sum()),
-    "Sin fecha": int((filtered["CLASIFICACION"] == "SIN FECHA").sum()),
-    "Responsables con alerta": int(filtered["IDENTIFICACION"].nunique()),
-}
-metric_cols = st.columns(5)
-for col, (label, value) in zip(metric_cols, metrics.items()):
-    col.metric(label, f"{value:,}".replace(",", "."))
-
-summary = summary_by_entity(filtered)
-messages = build_messages(filtered, reference_date)
-
-chart_data = (
-    filtered.groupby(["DOCUMENTO", "CLASIFICACION"], observed=True).size().reset_index(name="CANTIDAD")
+total = len(consolidado)
+conciliadas = int(consolidado["COINCIDE_REMESA_PAT_ASTRANS"].sum())
+sin_pat = total - conciliadas
+cancelados_ejecutados = int(
+    (consolidado["RESULTADO_SERVICIO"] == "CANCELADO EN DATA, PERO EJECUTADO CON REMESA").sum()
 )
-if not chart_data.empty:
-    fig = px.bar(
-        chart_data,
-        x="DOCUMENTO",
-        y="CANTIDAD",
-        color="CLASIFICACION",
-        barmode="group",
-        category_orders={"CLASIFICACION": STATUS_ORDER},
-        title="Alertas por tipo de documento",
-    )
-    fig.update_layout(xaxis_title="Documento", yaxis_title="Cantidad", legend_title="Clasificación")
-    st.plotly_chart(fig, use_container_width=True)
 
-vehicle_tab, driver_tab, messages_tab, detail_tab = st.tabs([
-    "🚐 Vehículos por placa", "👤 Conductores", "💬 Mensajes semanales", "🔎 Detalle completo"
+cols = st.columns(6)
+with cols[0]:
+    kpi("Registros ASTRANS", entero(total), "Base central")
+with cols[1]:
+    kpi("Conciliados PAT–ASTRANS", entero(conciliadas), porcentaje(conciliadas / total * 100 if total else 0))
+with cols[2]:
+    kpi("ASTRANS sin PAT", entero(sin_pat))
+with cols[3]:
+    kpi("PAT sin ASTRANS", entero(len(pat_sin_astrans)))
+with cols[4]:
+    kpi("DATA sin PAT", entero(len(data_sin_pat)))
+with cols[5]:
+    kpi("Cancelados ejecutados", entero(cancelados_ejecutados))
+
+tabs = st.tabs([
+    "Base Maestra",
+    "Cruce DATA–PAT",
+    "Diferencias",
+    "Duplicados",
 ])
 
-with vehicle_tab:
-    vehicle_view = summary[summary["TIPO_REGISTRO"] == "Vehículo"] if not summary.empty else summary
-    st.dataframe(vehicle_view, use_container_width=True, hide_index=True)
-
-with driver_tab:
-    driver_view = summary[summary["TIPO_REGISTRO"] == "Conductor"] if not summary.empty else summary
-    st.dataframe(driver_view, use_container_width=True, hide_index=True)
-
-with messages_tab:
-    st.caption("Los vehículos usan el celular disponible en la hoja. La hoja de conductores no contiene una columna de teléfono.")
-    st.dataframe(messages, use_container_width=True, hide_index=True, column_config={"MENSAJE": st.column_config.TextColumn(width="large")})
-    if not messages.empty:
-        selected_id = st.selectbox("Vista previa del mensaje", messages["IDENTIFICACION"].astype(str).tolist())
-        preview = messages.loc[messages["IDENTIFICACION"].astype(str) == str(selected_id), "MENSAJE"].iloc[0]
-        st.text_area("Mensaje listo para WhatsApp", preview, height=260)
-
-with detail_tab:
-    display_cols = [
-        "TIPO_REGISTRO", "IDENTIFICACION", "RESPONSABLE", "ESTADO_REGISTRO", "DOCUMENTO",
-        "FECHA_VENCIMIENTO", "DIAS_RESTANTES", "CLASIFICACION", "CELULAR_CONTACTO"
-    ]
-    detail = filtered[display_cols].sort_values(["CLASIFICACION", "DIAS_RESTANTES"], na_position="last")
-    st.dataframe(
-        detail,
-        use_container_width=True,
-        hide_index=True,
-        column_config={"FECHA_VENCIMIENTO": st.column_config.DateColumn(format="DD/MM/YYYY")},
+with tabs[0]:
+    st.subheader("Base Maestra RCN")
+    st.info(
+        "TRAYECTOS es la base central. PAT se relaciona por remesa exacta en toda la base. "
+        "DATA se relaciona con PAT por Fecha Servicio + No. Orden Servicio."
     )
+    st.dataframe(consolidado, use_container_width=True, hide_index=True)
 
-st.divider()
-excel_bytes = to_excel(filtered, summary, messages)
+with tabs[1]:
+    st.dataframe(cruce_data_pat, use_container_width=True, hide_index=True)
+
+with tabs[2]:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### PAT sin ASTRANS")
+        st.dataframe(pat_sin_astrans, use_container_width=True, hide_index=True)
+    with c2:
+        st.markdown("### DATA sin PAT")
+        st.dataframe(data_sin_pat, use_container_width=True, hide_index=True)
+
+with tabs[3]:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### Duplicados PAT")
+        st.dataframe(duplicados_pat, use_container_width=True, hide_index=True)
+    with c2:
+        st.markdown("### Duplicados ASTRANS")
+        st.dataframe(duplicados_astrans, use_container_width=True, hide_index=True)
+
+excel = crear_excel({
+    "BASE_MAESTRA_RCN": consolidado,
+    "CRUCE_DATA_PAT": cruce_data_pat,
+    "PAT_SIN_ASTRANS": pat_sin_astrans,
+    "DATA_SIN_PAT": data_sin_pat,
+    "DUPLICADOS_PAT": duplicados_pat,
+    "DUPLICADOS_ASTRANS": duplicados_astrans,
+})
+
 st.download_button(
-    "⬇️ Descargar reporte semanal en Excel",
-    data=excel_bytes,
-    file_name=f"alertas_documentales_{reference_date.strftime('%Y%m%d')}.xlsx",
+    "📥 Descargar Base Maestra RCN",
+    data=excel,
+    file_name="BASE_MAESTRA_RCN.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
 )
