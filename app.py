@@ -1,3 +1,4 @@
+
 import io
 import re
 import unicodedata
@@ -136,9 +137,9 @@ def leer_mejor_hoja(archivo_bytes: bytes, preferidas: tuple, claves: tuple):
                 continue
             cols = {normalizar_columna(c) for c in df.columns}
             puntaje = sum(c in cols for c in claves_norm)
-            if hoja in preferidas:
-                puntaje += 3
-            if puntaje > mejor_puntaje:
+            # La preferencia solo desempata; nunca debe ganar una hoja por nombre
+            # si otra contiene más columnas clave.
+            if puntaje > mejor_puntaje or (puntaje == mejor_puntaje and hoja in preferidas):
                 mejor_hoja, mejor_df, mejor_puntaje = hoja, df, puntaje
         except Exception:
             continue
@@ -159,6 +160,7 @@ def preparar_data(df: pd.DataFrame) -> pd.DataFrame:
                 "No Orden Servicio",
                 "NoOrdenServicio",
                 "Orden Servicio",
+                "SERVICIO",
             ],
         ),
         "estado": buscar_columna(df, ["Estado Servicio"]),
@@ -245,11 +247,11 @@ def preparar_pat(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def preparar_trayectos(df: pd.DataFrame) -> pd.DataFrame:
-    remesa_col = buscar_columna(df, ["REMESA"])
-    carga_col = buscar_columna(df, ["CARGA"])
-    estado_col = buscar_columna(df, ["ESTADO OP"])
+    remesa_col = buscar_columna(df, ["REMESA", "REMESAS", "TRAYECTO"])
+    carga_col = buscar_columna(df, ["CARGA", "FECHA SERVICIO", "FECHA R"])
+    estado_col = buscar_columna(df, ["ESTADO OP", "ESTADO OPER", "ESTADO OPERATIVO"])
     if not all([remesa_col, carga_col, estado_col]):
-        raise ValueError("TRAYECTOS debe contener REMESA, CARGA y ESTADO OP.")
+        raise ValueError("TRAYECTOS debe contener identificador de remesa/trayecto, CARGA y ESTADO OPER/ESTADO OP.")
 
     out = df.copy()
     out["ASTRANS_REMESA_NORM"] = out[remesa_col].apply(normalizar_id)
@@ -257,7 +259,7 @@ def preparar_trayectos(df: pd.DataFrame) -> pd.DataFrame:
     out["ASTRANS_ESTADO_OP_NORM"] = out[estado_col].apply(normalizar_texto)
 
     vcliente = buscar_columna(out, ["V.CLIENTE", "V CLIENTE"])
-    vconduct = buscar_columna(out, ["V.CONDUCT", "V CONDUCT"])
+    vconduct = buscar_columna(out, ["V.CONDUCT", "V CONDUCT", "V.CONDUCTOR", "V CONDUCTOR"])
     if vcliente:
         out["V_CLIENTE_NUM"] = convertir_numero(out[vcliente])
     else:
@@ -289,12 +291,58 @@ def unir_unicos(serie: pd.Series):
 
 
 def consolidar(data: pd.DataFrame, pat: pd.DataFrame, tray: pd.DataFrame):
-    data_ag = (
+    """
+    Regla histórica RCN:
+    1) CRUCE_DATA_PAT conserva TODOS los registros de DATA (base operativa).
+    2) DATA -> PAT se cruza por Fecha Servicio + No. Orden Servicio normalizados.
+    3) PAT -> ASTRANS se cruza por remesa exacta normalizada, sin restringir por fecha.
+    4) BASE_MAESTRA_RCN conserva TODOS los registros de TRAYECTOS (base financiera/ejecutada).
+    """
+
+    # PAT puede traer más de un registro para una misma Fecha + Orden.
+    # Se consolida solo para evitar multiplicar filas de DATA; NO se borran los duplicados,
+    # que se reportan aparte.
+    pat_por_llave = (
+        pat.groupby("LLAVE_DATA_PAT", as_index=False)
+        .agg(
+            PAT_REGISTROS_LLAVE=("LLAVE_DATA_PAT", "size"),
+            PAT_FECHA_SERVICIO=("PAT_FECHA_SERVICIO", "min"),
+            PAT_ORDEN_SERVICIO=("PAT_ORDEN_SERVICIO", unir_unicos),
+            PAT_REMESA=("PAT_REMESA", unir_unicos),
+            PAT_ESTADO=("PAT_ESTADO", unir_unicos),
+            PAT_CENTRO_ORDEN_COSTO=("PAT_CENTRO_ORDEN_COSTO", unir_unicos),
+            PAT_MODALIDAD=("PAT_MODALIDAD", unir_unicos),
+            PAT_MODALIDAD_TARIFA=("PAT_MODALIDAD_TARIFA", unir_unicos),
+            PAT_ORIGEN=("PAT_ORIGEN", unir_unicos),
+            PAT_DESTINO=("PAT_DESTINO", unir_unicos),
+        )
+    )
+
+    # IMPORTANTE: DATA queda a la izquierda. Así enero, febrero, mayo o cualquier mes
+    # siguen apareciendo aunque PAT no tenga evidencia para ese periodo.
+    cruce_data_pat = data.merge(pat_por_llave, on="LLAVE_DATA_PAT", how="left")
+    cruce_data_pat["COINCIDE_DATA_PAT"] = cruce_data_pat["PAT_REGISTROS_LLAVE"].fillna(0).gt(0)
+    cruce_data_pat["DIF_DIAS_DATA_PAT"] = (
+        cruce_data_pat["PAT_FECHA_SERVICIO"] - cruce_data_pat["DATA_FECHA_SERVICIO"]
+    ).dt.days
+
+    # Estado agrupado gerencial: TODO lo que no sea cancelación se considera PROGRAMADO.
+    # Conservamos el estado detallado original de DATA sin alterarlo.
+    cruce_data_pat["ESTADO_DETALLADO"] = cruce_data_pat["DATA_ESTADO_SERVICIO"]
+    cruce_data_pat["ESTADO_AGRUPADO"] = np.where(
+        cruce_data_pat["DATA_CANCELADO"], "CANCELADO", "PROGRAMADO"
+    )
+    cruce_data_pat["ANO_MES"] = cruce_data_pat["DATA_FECHA_SERVICIO"].dt.strftime("%Y-%m")
+
+    # Para ASTRANS, PAT sí se consolida por remesa exacta.
+    pat_valid = pat[pat["PAT_REMESA_NORM"].ne("")].copy()
+    # Recuperar información DATA a nivel llave antes de agrupar por remesa.
+    data_por_llave = (
         data.groupby("LLAVE_DATA_PAT", as_index=False)
         .agg(
             DATA_REGISTROS=("LLAVE_DATA_PAT", "size"),
             DATA_FECHA_SERVICIO=("DATA_FECHA_SERVICIO", "min"),
-            DATA_ORDEN_SERVICIO=("DATA_ORDEN_SERVICIO", primer_valido),
+            DATA_ORDEN_SERVICIO=("DATA_ORDEN_SERVICIO", unir_unicos),
             DATA_ESTADO_SERVICIO=("DATA_ESTADO_SERVICIO", unir_unicos),
             DATA_CENTRO_ORDEN_COSTO=("DATA_CENTRO_ORDEN_COSTO", unir_unicos),
             DATA_MODALIDAD_SERVICIO=("DATA_MODALIDAD_SERVICIO", unir_unicos),
@@ -305,16 +353,11 @@ def consolidar(data: pd.DataFrame, pat: pd.DataFrame, tray: pd.DataFrame):
             DATA_CANCELADO=("DATA_CANCELADO", "max"),
         )
     )
-
-    pat_data = pat.merge(data_ag, on="LLAVE_DATA_PAT", how="left")
+    pat_data = pat_valid.merge(data_por_llave, on="LLAVE_DATA_PAT", how="left")
     pat_data["COINCIDE_DATA_PAT"] = pat_data["DATA_REGISTROS"].fillna(0).gt(0)
-    pat_data["DIF_DIAS_DATA_PAT"] = (
-        pat_data["PAT_FECHA_SERVICIO"] - pat_data["DATA_FECHA_SERVICIO"]
-    ).dt.days
 
-    pat_valid = pat_data[pat_data["PAT_REMESA_NORM"].ne("")].copy()
     pat_remesa = (
-        pat_valid.groupby("PAT_REMESA_NORM", as_index=False)
+        pat_data.groupby("PAT_REMESA_NORM", as_index=False)
         .agg(
             PAT_REGISTROS=("PAT_REMESA_NORM", "size"),
             PAT_FECHA_SERVICIO=("PAT_FECHA_SERVICIO", "min"),
@@ -342,16 +385,13 @@ def consolidar(data: pd.DataFrame, pat: pd.DataFrame, tray: pd.DataFrame):
     )
 
     consolidado = tray.merge(
-        pat_remesa,
-        left_on="ASTRANS_REMESA_NORM",
-        right_on="PAT_REMESA_NORM",
-        how="left",
+        pat_remesa, left_on="ASTRANS_REMESA_NORM", right_on="PAT_REMESA_NORM", how="left"
     )
-
     consolidado["COINCIDE_REMESA_PAT_ASTRANS"] = consolidado["PAT_REGISTROS"].fillna(0).gt(0)
     consolidado["DIF_DIAS_PAT_ASTRANS"] = (
         consolidado["ASTRANS_CARGA_FECHA"] - consolidado["PAT_FECHA_SERVICIO"]
     ).dt.days
+    consolidado["ANO_MES_ASTRANS"] = consolidado["ASTRANS_CARGA_FECHA"].dt.strftime("%Y-%m")
 
     consolidado["ESTADO_TRAZABILIDAD"] = np.select(
         [
@@ -380,32 +420,26 @@ def consolidar(data: pd.DataFrame, pat: pd.DataFrame, tray: pd.DataFrame):
     )
 
     remesas_astrans = set(tray.loc[tray["ASTRANS_REMESA_NORM"].ne(""), "ASTRANS_REMESA_NORM"])
-    pat_sin_astrans = pat_remesa[
-        ~pat_remesa["PAT_REMESA_NORM"].isin(remesas_astrans)
-    ].copy()
+    pat_sin_astrans = pat_remesa[~pat_remesa["PAT_REMESA_NORM"].isin(remesas_astrans)].copy()
 
     llaves_pat = set(pat["LLAVE_DATA_PAT"])
     data_sin_pat = data[~data["LLAVE_DATA_PAT"].isin(llaves_pat)].copy()
 
     duplicados_pat = (
         pat[pat["PAT_REMESA_NORM"].ne("")]
-        .groupby("PAT_REMESA_NORM", as_index=False)
-        .size()
+        .groupby("PAT_REMESA_NORM", as_index=False).size()
         .rename(columns={"size": "CANTIDAD_PAT"})
     )
     duplicados_pat = duplicados_pat[duplicados_pat["CANTIDAD_PAT"] > 1]
 
     duplicados_astrans = (
         tray[tray["ASTRANS_REMESA_NORM"].ne("")]
-        .groupby("ASTRANS_REMESA_NORM", as_index=False)
-        .size()
+        .groupby("ASTRANS_REMESA_NORM", as_index=False).size()
         .rename(columns={"size": "CANTIDAD_ASTRANS"})
     )
-    duplicados_astrans = duplicados_astrans[
-        duplicados_astrans["CANTIDAD_ASTRANS"] > 1
-    ]
+    duplicados_astrans = duplicados_astrans[duplicados_astrans["CANTIDAD_ASTRANS"] > 1]
 
-    return consolidado, pat_data, pat_sin_astrans, data_sin_pat, duplicados_pat, duplicados_astrans
+    return consolidado, cruce_data_pat, pat_sin_astrans, data_sin_pat, duplicados_pat, duplicados_astrans
 
 
 def crear_excel(resultados: dict[str, pd.DataFrame]) -> bytes:
@@ -473,12 +507,19 @@ try:
     hoja_tray, raw_tray = leer_mejor_hoja(
         f_tray.getvalue(),
         ("Sheet1",),
-        ("REMESA", "CARGA", "ESTADO OP"),
+        ("REMESA", "TRAYECTO", "CARGA", "ESTADO OPER", "ESTADO OP"),
     )
 
     data = preparar_data(raw_data)
     pat = preparar_pat(raw_pat)
     tray = preparar_trayectos(raw_tray)
+
+    # Control visible de lectura histórica
+    st.success(
+        f"Lectura OK | DATA: {hoja_data} ({len(data):,} registros) | "
+        f"PAT: {hoja_pat} ({len(pat):,} registros) | "
+        f"TRAYECTOS: {hoja_tray} ({len(tray):,} registros)"
+    )
 
     (
         consolidado,
